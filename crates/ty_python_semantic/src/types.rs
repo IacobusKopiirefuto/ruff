@@ -64,6 +64,7 @@ use crate::types::generics::{
 use crate::types::infer::infer_unpack_types;
 use crate::types::mro::{Mro, MroError, MroIterator};
 pub(crate) use crate::types::narrow::infer_narrowing_constraint;
+use crate::types::newtype::NewType;
 use crate::types::signatures::{ParameterForm, walk_signature};
 use crate::types::tuple::{TupleSpec, TupleSpecBuilder};
 pub(crate) use crate::types::typed_dict::{TypedDictParams, TypedDictType, walk_typed_dict_type};
@@ -96,6 +97,7 @@ mod instance;
 mod member;
 mod mro;
 mod narrow;
+mod newtype;
 mod protocol_class;
 mod signatures;
 mod special_form;
@@ -781,6 +783,13 @@ pub enum Type<'db> {
     TypedDict(TypedDictType<'db>),
     /// An aliased type (lazily not-yet-unpacked to its value type).
     TypeAlias(TypeAliasType<'db>),
+    /// The set of Python objects that belong to a `typing.NewType` subtype. Note that
+    /// `typing.NewType` itself is a `Type::ClassLiteral` with `KnownClass::NewType`, and the
+    /// identity functions it returns (which behave like subtypes in type expressions) are of
+    /// `Type::KnownInstance` with `KnownInstanceType::NewType`. This `Type` refers to the objects
+    /// wrapped/returned by a specific one of those identity functions, or by another that inherits
+    /// from it.
+    NewTypeInstance(NewType<'db>),
 }
 
 #[salsa::tracked]
@@ -1369,6 +1378,9 @@ impl<'db> Type<'db> {
                 self
             }
             Type::TypeAlias(alias) => alias.value_type(db).normalized_impl(db, visitor),
+            Type::NewTypeInstance(newtype) => {
+                Type::NewTypeInstance(newtype.normalized_impl(db, visitor))
+            }
             Type::LiteralString
             | Type::AlwaysFalsy
             | Type::AlwaysTruthy
@@ -1431,7 +1443,8 @@ impl<'db> Type<'db> {
             | Type::BoundSuper(_)
             | Type::TypeIs(_)
             | Type::TypedDict(_)
-            | Type::TypeAlias(_) => false,
+            | Type::TypeAlias(_)
+            | Type::NewTypeInstance(_) => false,
         }
     }
 
@@ -1468,6 +1481,8 @@ impl<'db> Type<'db> {
             }
 
             Type::GenericAlias(alias) => Some(ClassType::Generic(alias).into_callable(db)),
+
+            Type::NewTypeInstance(newtype) => Some(newtype.base_class_type(db).into_callable(db)),
 
             // TODO: This is unsound so in future we can consider an opt-in option to disable it.
             Type::SubclassOf(subclass_of_ty) => match subclass_of_ty.subclass_of() {
@@ -2364,6 +2379,22 @@ impl<'db> Type<'db> {
                 })
             }
 
+            (Type::NewTypeInstance(self_newtype), Type::NewTypeInstance(target_newtype)) => {
+                self_newtype.has_relation_to_impl(db, target_newtype)
+            }
+
+            (
+                Type::NewTypeInstance(self_newtype),
+                Type::NominalInstance(target_nominal_instance),
+            ) => self_newtype.base_class_type(db).has_relation_to_impl(
+                db,
+                target_nominal_instance.class(db),
+                inferable,
+                relation,
+                relation_visitor,
+                disjointness_visitor,
+            ),
+
             (Type::PropertyInstance(_), _) => {
                 KnownClass::Property.to_instance(db).has_relation_to_impl(
                     db,
@@ -2391,6 +2422,7 @@ impl<'db> Type<'db> {
                 ConstraintSet::from(false)
             }
             (Type::NominalInstance(_), _) => ConstraintSet::from(false),
+            (Type::NewTypeInstance(_), _) => ConstraintSet::from(false),
         }
     }
 
@@ -3223,6 +3255,19 @@ impl<'db> Type<'db> {
                     )
                 }),
 
+            (Type::NewTypeInstance(left), Type::NewTypeInstance(right)) => {
+                left.is_disjoint_from_impl(db, right)
+            }
+            (Type::NewTypeInstance(newtype), other) | (other, Type::NewTypeInstance(newtype)) => {
+                Type::instance(db, newtype.base_class_type(db)).is_disjoint_from_impl(
+                    db,
+                    other,
+                    inferable,
+                    disjointness_visitor,
+                    relation_visitor,
+                )
+            }
+
             (Type::PropertyInstance(_), other) | (other, Type::PropertyInstance(_)) => {
                 KnownClass::Property.to_instance(db).is_disjoint_from_impl(
                     db,
@@ -3367,6 +3412,9 @@ impl<'db> Type<'db> {
             Type::TypeIs(type_is) => type_is.is_bound(db),
             Type::TypedDict(_) => false,
             Type::TypeAlias(alias) => alias.value_type(db).is_singleton(db),
+            Type::NewTypeInstance(newtype) => {
+                Type::instance(db, newtype.base_class_type(db)).is_singleton(db)
+            }
         }
     }
 
@@ -3417,6 +3465,9 @@ impl<'db> Type<'db> {
             }
 
             Type::NominalInstance(instance) => instance.is_single_valued(db),
+            Type::NewTypeInstance(newtype) => {
+                Type::instance(db, newtype.base_class_type(db)).is_single_valued(db)
+            }
 
             Type::BoundSuper(_) => {
                 // At runtime two super instances never compare equal, even if their arguments are identical.
@@ -3580,7 +3631,8 @@ impl<'db> Type<'db> {
             | Type::ProtocolInstance(_)
             | Type::PropertyInstance(_)
             | Type::TypeIs(_)
-            | Type::TypedDict(_) => None,
+            | Type::TypedDict(_)
+            | Type::NewTypeInstance(_) => None,
         }
     }
 
@@ -3667,6 +3719,7 @@ impl<'db> Type<'db> {
             Type::Dynamic(_) | Type::Never => Place::bound(self).into(),
 
             Type::NominalInstance(instance) => instance.class(db).instance_member(db, name),
+            Type::NewTypeInstance(newtype) => newtype.base_class_type(db).instance_member(db, name),
 
             Type::ProtocolInstance(protocol) => protocol.instance_member(db, name),
 
@@ -4306,6 +4359,7 @@ impl<'db> Type<'db> {
 
             Type::NominalInstance(..)
             | Type::ProtocolInstance(..)
+            | Type::NewTypeInstance(..)
             | Type::BooleanLiteral(..)
             | Type::IntLiteral(..)
             | Type::StringLiteral(..)
@@ -4744,6 +4798,8 @@ impl<'db> Type<'db> {
                     .value_type(db)
                     .try_bool_impl(db, allow_short_circuit, visitor)
             })?,
+            Type::NewTypeInstance(newtype) => Type::instance(db, newtype.base_class_type(db))
+                .try_bool_impl(db, allow_short_circuit, visitor)?,
         };
 
         Ok(truthiness)
@@ -5141,6 +5197,24 @@ impl<'db> Type<'db> {
                     .into()
                 }
 
+                Some(KnownClass::NewType) => {
+                    Binding::single(
+                        self,
+                        Signature::new(
+                            Parameters::new([
+                                Parameter::positional_or_keyword(Name::new_static("name"))
+                                    .with_annotated_type(Type::LiteralString),
+                                Parameter::positional_or_keyword(Name::new_static("tp")),
+                            ]),
+                            // The actual return type is a KnownInstanceType::NewType(_), but each
+                            // callsite gets a unique payload, including a `Definition` that points
+                            // to that callsite. See `struct NewType` and `infer_newtype_expression`.
+                            None,
+                        ),
+                    )
+                    .into()
+                }
+
                 Some(KnownClass::Object) => {
                     // ```py
                     // class object:
@@ -5430,7 +5504,7 @@ impl<'db> Type<'db> {
                 SubclassOfInner::Class(class) => Type::from(class).bindings(db),
             },
 
-            Type::NominalInstance(_) | Type::ProtocolInstance(_) => {
+            Type::NominalInstance(_) | Type::ProtocolInstance(_) | Type::NewTypeInstance(_) => {
                 // Note that for objects that have a (possibly not callable!) `__call__` attribute,
                 // we will get the signature of the `__call__` attribute, but will pass in the type
                 // of the original object as the "callable type". That ensures that we get errors
@@ -5482,6 +5556,16 @@ impl<'db> Type<'db> {
             Type::SpecialForm(_) => CallableBinding::not_callable(self).into(),
 
             Type::EnumLiteral(enum_literal) => enum_literal.enum_class_instance(db).bindings(db),
+
+            Type::KnownInstance(KnownInstanceType::NewType(newtype)) => Binding::single(
+                self,
+                Signature::new(
+                    Parameters::new([Parameter::positional_only(None)
+                        .with_annotated_type(newtype.base(db).instance_type(db))]),
+                    Some(Type::NewTypeInstance(newtype)),
+                ),
+            )
+            .into(),
 
             Type::KnownInstance(known_instance) => {
                 known_instance.instance_fallback(db).bindings(db)
@@ -5617,6 +5701,7 @@ impl<'db> Type<'db> {
 
             match ty {
                 Type::NominalInstance(nominal) => nominal.tuple_spec(db),
+                Type::NewTypeInstance(newtype) => non_async_special_case(db, Type::instance(db, newtype.base_class_type(db))),
                 Type::GenericAlias(alias) if alias.origin(db).is_tuple(db) => {
                     Some(Cow::Owned(TupleSpec::homogeneous(todo_type!(
                         "*tuple[] annotations"
@@ -6247,6 +6332,9 @@ impl<'db> Type<'db> {
             Type::ClassLiteral(class) => Some(Type::instance(db, class.default_specialization(db))),
             Type::GenericAlias(alias) => Some(Type::instance(db, ClassType::from(alias))),
             Type::SubclassOf(subclass_of_ty) => Some(subclass_of_ty.to_instance(db)),
+            Type::KnownInstance(KnownInstanceType::NewType(newtype)) => {
+                Some(Type::NewTypeInstance(newtype))
+            }
             Type::Union(union) => union.to_instance(db),
             // If there is no bound or constraints on a typevar `T`, `T: object` implicitly, which
             // has no instance type. Otherwise, synthesize a typevar with bound or constraints
@@ -6277,7 +6365,8 @@ impl<'db> Type<'db> {
             | Type::AlwaysTruthy
             | Type::AlwaysFalsy
             | Type::TypeIs(_)
-            | Type::TypedDict(_) => None,
+            | Type::TypedDict(_)
+            | Type::NewTypeInstance(_) => None,
         }
     }
 
@@ -6356,6 +6445,7 @@ impl<'db> Type<'db> {
 
             Type::KnownInstance(known_instance) => match known_instance {
                 KnownInstanceType::TypeAliasType(alias) => Ok(Type::TypeAlias(*alias)),
+                KnownInstanceType::NewType(newtype) => Ok(Type::NewTypeInstance(*newtype)),
                 KnownInstanceType::TypeVar(typevar) => {
                     let index = semantic_index(db, scope_id.file(db));
                     Ok(bind_typevar(
@@ -6552,9 +6642,6 @@ impl<'db> Type<'db> {
                 Some(KnownClass::TypeVarTuple) => Ok(todo_type!(
                     "Support for `typing.TypeVarTuple` instances in type expressions"
                 )),
-                Some(KnownClass::NewType) => Ok(todo_type!(
-                    "Support for `typing.NewType` instances in type expressions"
-                )),
                 Some(KnownClass::GenericAlias) => Ok(todo_type!(
                     "Support for `typing.GenericAlias` instances in type expressions"
                 )),
@@ -6576,6 +6663,13 @@ impl<'db> Type<'db> {
                     .value_type(db)
                     .in_type_expression(db, scope_id, typevar_binding_context)
             }
+
+            Type::NewTypeInstance(_) => Err(InvalidTypeExpressionError {
+                invalid_expressions: smallvec::smallvec_inline![
+                    InvalidTypeExpression::InvalidType(*self, scope_id)
+                ],
+                fallback_type: Type::unknown(),
+            }),
         }
     }
 
@@ -6650,6 +6744,9 @@ impl<'db> Type<'db> {
             // understand a more specific meta type in order to correctly handle `__getitem__`.
             Type::TypedDict(typed_dict) => SubclassOfType::from(db, typed_dict.defining_class()),
             Type::TypeAlias(alias) => alias.value_type(db).to_meta_type(db),
+            Type::NewTypeInstance(newtype) => {
+                Type::KnownInstance(KnownInstanceType::NewType(newtype))
+            }
         }
     }
 
@@ -6759,8 +6856,8 @@ impl<'db> Type<'db> {
                     | TypeMapping::ReplaceParameterDefaults
                     | TypeMapping::BindLegacyTypevars(_) => self,
                 TypeMapping::Materialize(materialization_kind)  => {
-                Type::TypeVar(bound_typevar.materialize_impl(db, *materialization_kind, visitor))
-            }
+                    Type::TypeVar(bound_typevar.materialize_impl(db, *materialization_kind, visitor))
+                }
             }
 
             Type::KnownInstance(KnownInstanceType::TypeVar(typevar)) => match type_mapping {
@@ -6793,6 +6890,10 @@ impl<'db> Type<'db> {
 
             Type::NominalInstance(instance) => {
                 instance.apply_type_mapping_impl(db, type_mapping, tcx, visitor)
+            },
+
+            Type::NewTypeInstance(newtype) => {
+                Type::NewTypeInstance(newtype.apply_type_mapping_impl(db, type_mapping, tcx, visitor))
             },
 
             Type::ProtocolInstance(instance) => {
@@ -7037,6 +7138,15 @@ impl<'db> Type<'db> {
                 instance.find_legacy_typevars_impl(db, binding_context, typevars, visitor);
             }
 
+            Type::NewTypeInstance(newtype) => {
+                newtype.base_class_type(db).find_legacy_typevars_impl(
+                    db,
+                    binding_context,
+                    typevars,
+                    visitor,
+                );
+            }
+
             Type::SubclassOf(subclass_of) => {
                 subclass_of.find_legacy_typevars_impl(db, binding_context, typevars, visitor);
             }
@@ -7190,6 +7300,7 @@ impl<'db> Type<'db> {
             },
 
             Self::TypeAlias(alias) => alias.value_type(db).definition(db),
+            Self::NewTypeInstance(newtype) => Some(TypeDefinition::NewType(newtype.definition(db))),
 
             Self::StringLiteral(_)
             | Self::BooleanLiteral(_)
@@ -7413,7 +7524,9 @@ impl<'db> VarianceInferable<'db> for Type<'db> {
             | Type::BoundSuper(_)
             | Type::TypeVar(_)
             | Type::TypedDict(_)
-            | Type::TypeAlias(_) => TypeVarVariance::Bivariant,
+            | Type::TypeAlias(_)
+            // REVIEWERS: Is this correct?
+            | Type::NewTypeInstance(_) => TypeVarVariance::Bivariant,
         };
 
         tracing::debug!(
@@ -7570,6 +7683,10 @@ pub enum KnownInstanceType<'db> {
     /// A constraint set, which is exposed in mdtests as an instance of
     /// `ty_extensions.ConstraintSet`.
     ConstraintSet(TrackedConstraintSet<'db>),
+
+    /// An identity function created with `typing.NewType(name, base)`, which behaves like a
+    /// subtype of `base` in type expressions. See the `struct NewType` payload for an example.
+    NewType(NewType<'db>),
 }
 
 fn walk_known_instance_type<'db, V: visitor::TypeVisitor<'db> + ?Sized>(
@@ -7594,6 +7711,11 @@ fn walk_known_instance_type<'db, V: visitor::TypeVisitor<'db> + ?Sized>(
         KnownInstanceType::Field(field) => {
             if let Some(default_ty) = field.default_type(db) {
                 visitor.visit_type(db, default_ty);
+            }
+        }
+        KnownInstanceType::NewType(newtype) => {
+            if let ClassType::Generic(generic_alias) = newtype.base_class_type(db) {
+                visitor.visit_generic_alias_type(db, generic_alias);
             }
         }
     }
@@ -7632,6 +7754,7 @@ impl<'db> KnownInstanceType<'db> {
                 // Nothing to normalize
                 Self::ConstraintSet(set)
             }
+            Self::NewType(newtype) => Self::NewType(newtype.normalized_impl(db, visitor)),
         }
     }
 
@@ -7646,6 +7769,7 @@ impl<'db> KnownInstanceType<'db> {
             Self::Deprecated(_) => KnownClass::Deprecated,
             Self::Field(_) => KnownClass::Field,
             Self::ConstraintSet(_) => KnownClass::ConstraintSet,
+            Self::NewType(_) => KnownClass::NewType,
         }
     }
 
@@ -7718,6 +7842,9 @@ impl<'db> KnownInstanceType<'db> {
                             "ty_extensions.ConstraintSet[{}]",
                             constraints.display(self.db)
                         )
+                    }
+                    KnownInstanceType::NewType(declaration) => {
+                        write!(f, "<NewType pseudo-class '{}'>", declaration.name(self.db))
                     }
                 }
             }
