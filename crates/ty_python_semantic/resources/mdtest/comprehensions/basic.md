@@ -121,7 +121,17 @@ reveal_type({x: str(x) for x in range(10)})
 # revealed: list[tuple[int, Unknown | str]]
 reveal_type([(x, y) for x in range(5) for y in ["a", "b", "c"]])
 
-xs: list[int] = [x**2 for x in [1, 2, 3]]
-# TODO: ?
-reveal_type(xs)  # revealed: list[Unknown | int]
+squares: list[int | None] = [x**2 for x in range(10)]
+reveal_type(squares)  # revealed: list[int | None]
+
+xs: list[int] = [x for x in [1, 2, 3]]
+reveal_type(xs)  # revealed: list[int]
+
+table = [[(x, y) for x in range(3)] for y in range(3)]
+reveal_type(table)  # revealed: list[list[tuple[int, int]]]
+
+# TODO: no error here
+# error: [invalid-assignment]
+table_with_content: list[list[tuple[int, int, str | None]]] = [[(x, y, None) for x in range(3)] for y in range(3)]
+reveal_type(table_with_content)  # revealed: list[list[tuple[int, int, str | None]]]
 ```

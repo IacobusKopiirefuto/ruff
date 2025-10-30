@@ -355,7 +355,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::ListComp(listcomp) => {
-                self.infer_list_comprehension_expression(listcomp);
+                self.infer_list_comprehension_expression(listcomp, TypeContext::default());
                 self.report_invalid_type_expression(
                     expression,
                     format_args!("List comprehensions are not allowed in type expressions"),
