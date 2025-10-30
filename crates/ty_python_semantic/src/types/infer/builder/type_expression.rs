@@ -346,7 +346,7 @@ impl<'db> TypeInferenceBuilder<'db, '_> {
             }
 
             ast::Expr::DictComp(dictcomp) => {
-                self.infer_dict_comprehension_expression(dictcomp);
+                self.infer_dict_comprehension_expression(dictcomp, TypeContext::default());
                 self.report_invalid_type_expression(
                     expression,
                     format_args!("Dict comprehensions are not allowed in type expressions"),

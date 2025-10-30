@@ -109,6 +109,8 @@ async def _():
 The type of the comprehension expression itself should reflect the inferred element type:
 
 ```py
+from typing import TypedDict
+
 # revealed: list[int]
 reveal_type([x for x in range(10)])
 
@@ -123,9 +125,18 @@ reveal_type([(x, y) for x in range(5) for y in ["a", "b", "c"]])
 
 squares: list[int | None] = [x**2 for x in range(10)]
 reveal_type(squares)  # revealed: list[int | None]
+```
+
+Inference for list comprehensions takes the type context into account:
+
+```py
+reveal_type([x for x in [1, 2, 3]])  # revealed: list[Unknown | int]
 
 xs: list[int] = [x for x in [1, 2, 3]]
 reveal_type(xs)  # revealed: list[int]
+
+ys: dict[int, str] = {x: str(x) for x in [1, 2, 3]}
+reveal_type(ys)  # revealed: dict[int, str]
 
 table = [[(x, y) for x in range(3)] for y in range(3)]
 reveal_type(table)  # revealed: list[list[tuple[int, int]]]
@@ -134,4 +145,13 @@ reveal_type(table)  # revealed: list[list[tuple[int, int]]]
 # error: [invalid-assignment]
 table_with_content: list[list[tuple[int, int, str | None]]] = [[(x, y, None) for x in range(3)] for y in range(3)]
 reveal_type(table_with_content)  # revealed: list[list[tuple[int, int, str | None]]]
+
+class Person(TypedDict):
+    name: str
+
+persons: list[Person] = [{"name": n} for n in ["Alice", "Bob"]]
+reveal_type(persons)  # revealed: list[Person]
+
+# TODO: This should be an error
+invalid: list[Person] = [{"misspelled": n} for n in ["Alice", "Bob"]]
 ```

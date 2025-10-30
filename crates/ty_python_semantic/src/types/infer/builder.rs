@@ -5812,7 +5812,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             ast::Expr::ListComp(listcomp) => {
                 self.infer_list_comprehension_expression(listcomp, tcx)
             }
-            ast::Expr::DictComp(dictcomp) => self.infer_dict_comprehension_expression(dictcomp),
+            ast::Expr::DictComp(dictcomp) => {
+                self.infer_dict_comprehension_expression(dictcomp, tcx)
+            }
             ast::Expr::SetComp(setcomp) => self.infer_set_comprehension_expression(setcomp),
             ast::Expr::Name(name) => self.infer_name_expression(name),
             ast::Expr::Attribute(attribute) => self.infer_attribute_expression(attribute),
@@ -6337,35 +6339,29 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         let collection_class = KnownClass::List;
 
-        let Some(generic_context) = KnownClass::List
-            .try_to_class_literal(self.db())
-            .and_then(|class| class.generic_context(self.db()))
-        else {
-            return KnownClass::List.to_specialized_instance(self.db(), [element_type]);
-        };
-
-        let inferable = generic_context.inferable_typevars(self.db());
         let tcx = tcx.map(|annotation| {
             let collection_ty = collection_class.to_instance(self.db());
-            annotation.filter_disjoint_elements(self.db(), collection_ty, inferable)
+            annotation.filter_disjoint_elements(self.db(), collection_ty, InferableTypeVars::None)
         });
-
-        // Extract the annotated type of `T`, if provided.
-        let Some(&[annotated_element_type]) = tcx
+        if let Some(annotated_element_type) = tcx
             .known_specialization(self.db(), collection_class)
             .map(|specialization| specialization.types(self.db()))
-        else {
-            return KnownClass::List.to_specialized_instance(self.db(), [element_type]);
-        };
-
-        if element_type.is_assignable_to(self.db(), annotated_element_type) {
-            KnownClass::List.to_specialized_instance(self.db(), [annotated_element_type])
+            .and_then(|types| types.first().copied())
+            .filter(|annotated_element_type| {
+                element_type.is_assignable_to(self.db(), *annotated_element_type)
+            })
+        {
+            collection_class.to_specialized_instance(self.db(), [annotated_element_type])
         } else {
-            KnownClass::List.to_specialized_instance(self.db(), [element_type])
+            collection_class.to_specialized_instance(self.db(), [element_type])
         }
     }
 
-    fn infer_dict_comprehension_expression(&mut self, dictcomp: &ast::ExprDictComp) -> Type<'db> {
+    fn infer_dict_comprehension_expression(
+        &mut self,
+        dictcomp: &ast::ExprDictComp,
+        tcx: TypeContext<'db>,
+    ) -> Type<'db> {
         let ast::ExprDictComp {
             range: _,
             node_index: _,
@@ -6384,7 +6380,29 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let key_type = inference.expression_type(key.as_ref());
         let value_type = inference.expression_type(value.as_ref());
 
-        KnownClass::Dict.to_specialized_instance(self.db(), [key_type, value_type])
+        let collection_class = KnownClass::Dict;
+
+        let tcx = tcx.map(|annotation| {
+            let collection_ty = collection_class.to_instance(self.db());
+            annotation.filter_disjoint_elements(self.db(), collection_ty, InferableTypeVars::None)
+        });
+        if let Some([annotated_key_type, annotated_value_type]) = tcx
+            .known_specialization(self.db(), collection_class)
+            .map(|specialization| specialization.types(self.db()))
+            .filter(|types| {
+                if let [annotated_key_type, annotated_value_type] = types {
+                    key_type.is_assignable_to(self.db(), *annotated_key_type)
+                        && value_type.is_assignable_to(self.db(), *annotated_value_type)
+                } else {
+                    false
+                }
+            })
+        {
+            collection_class
+                .to_specialized_instance(self.db(), [*annotated_key_type, *annotated_value_type])
+        } else {
+            collection_class.to_specialized_instance(self.db(), [key_type, value_type])
+        }
     }
 
     fn infer_set_comprehension_expression(&mut self, setcomp: &ast::ExprSetComp) -> Type<'db> {
