@@ -695,8 +695,10 @@ impl<'db> Bindings<'db> {
 
                         Some(KnownFunction::IsSubtypeOf) => {
                             if let [Some(ty_a), Some(ty_b)] = overload.parameter_types() {
+                                eprintln!("==> subtype {} {}", ty_a.display(db), ty_b.display(db));
                                 let constraints =
                                     ty_a.when_subtype_of(db, *ty_b, InferableTypeVars::None);
+                                eprintln!("  {}", constraints.display_graph(db, &"  "));
                                 let tracked = TrackedConstraintSet::new(db, constraints);
                                 overload.set_return_type(Type::KnownInstance(
                                     KnownInstanceType::ConstraintSet(tracked),
